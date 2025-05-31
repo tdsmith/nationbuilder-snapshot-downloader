@@ -1,9 +1,8 @@
 #! /usr/bin/env node
-import { chromium, Page } from "playwright-core";
+import { chromium, devices } from "playwright-core";
 import { expect, Locator } from "@playwright/test";
 import * as logger from "winston";
 import { Command } from "commander";
-import { assert } from "console";
 
 /* accept a usernmae, password, and nationbuilder url */
 async function download_snapshot(
@@ -14,11 +13,19 @@ async function download_snapshot(
   outputDir: string
 ) {
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  const desktop = devices["Desktop Chrome HiDPI"];
+  const context = await browser.newContext({
+    ...desktop,
+    locale: 'en-US',
+    timezoneId: 'America/Los_Angeles',
+  });
+  const page = await context.newPage();
 
   logger.info(`Navigating to ${nationbuilder_url}`);
 
   await page.goto(nationbuilder_url);
+  logger.info(`Page title: ${await page.title()}`);
+  logger.info(`Page content starts with: ${(await page.content()).substring(0, 500)}`);
   await page.getByLabel("Email").click();
   await page.getByLabel("Email").fill(username);
   await page.getByLabel("Email").press("Tab");
