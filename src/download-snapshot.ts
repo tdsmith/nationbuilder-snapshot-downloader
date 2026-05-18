@@ -10,9 +10,12 @@ async function download_snapshot(
   password: string,
   otp: string,
   nationbuilder_url: string,
-  outputDir: string
+  outputDir: string,
+  proxy?: string
 ) {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch(
+    proxy ? { proxy: { server: proxy } } : {}
+  );
   const desktop = devices["Desktop Chrome HiDPI"];
   const context = await browser.newContext({
     ...desktop,
@@ -108,14 +111,15 @@ async function main(
   password: string,
   otp: string,
   nationbuilder_url: string,
-  outputDir: string
+  outputDir: string,
+  proxy?: string
 ) {
   logger.configure({
     level: "info",
     transports: [new logger.transports.Console()],
   });
 
-  await download_snapshot(username, password, otp, nationbuilder_url, outputDir);
+  await download_snapshot(username, password, otp, nationbuilder_url, outputDir, proxy);
 }
 
 const program = new Command();
@@ -130,6 +134,7 @@ program
     "-t, --otp <otp>",
     "TOTP one-time password"
   )
+  .option("--proxy <server>", "Proxy server URL for Playwright")
   .requiredOption(
     "-n, --nationbuilder_url <nationbuilder_url>",
     "URL of your nationbuilder admin login page"
@@ -149,7 +154,8 @@ program
       password,
       options.otp,
       options.nationbuilder_url,
-      options.output_dir
+      options.output_dir,
+      options.proxy
     );
   });
 
