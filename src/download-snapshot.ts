@@ -3,6 +3,28 @@ import { chromium, devices } from "playwright-core";
 import { expect, Locator } from "@playwright/test";
 import * as logger from "winston";
 import { Command } from "commander";
+import { createHmac } from "crypto";
+
+function totpFromOtpauth(otpauthUrl: string): string {
+  const url = new URL(otpauthUrl);
+  const raw = url.searchParams.get("secret")!.toUpperCase().replace(/=+$/, "");
+  const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, val = 0;
+  const keyBytes: number[] = [];
+  for (const c of raw) {
+    val = (val << 5) | alpha.indexOf(c);
+    bits += 5;
+    if (bits >= 8) { keyBytes.push((val >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  const key = new Uint8Array(keyBytes);
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  const counterBuf = new Uint8Array(8);
+  new DataView(counterBuf.buffer).setBigUint64(0, BigInt(counter), false);
+  const hmac = Array.from(createHmac("sha1", key).update(counterBuf).digest());
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const code = (((hmac[offset] & 0x7f) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3]) % 1_000_000;
+  return String(code).padStart(6, "0");
+}
 
 /* accept a usernmae, password, and nationbuilder url */
 async function download_snapshot(
@@ -32,7 +54,7 @@ async function download_snapshot(
   await page.getByLabel("Email").click();
   await page.getByLabel("Email").fill(username);
   await page.getByLabel("Email").press("Tab");
-  await page.getByRole('textbox', {name: "Password"}).fill(password);
+  await page.getByRole('textbox', { name: "Password" }).fill(password);
   logger.info("Logging in.");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   if (otp) {
@@ -46,9 +68,8 @@ async function download_snapshot(
   await page.getByRole("link", { name: "Database" }).click();
 
   // compute string that includes today's date only - excluding time
-  const snapshotSignature = `Data Committee Snapshot ${
-    new Date().toISOString().split("T")[0]
-  }`;
+  const snapshotSignature = `Data Committee Snapshot ${new Date().toISOString().split("T")[0]
+    }`;
   const snapshotTrLocator = `table > tbody > tr:has-text("${snapshotSignature}")`;
 
   // if tr with row containing snapshotSignature does not exist in 5 seconds, create a new snapshot
@@ -125,34 +146,37 @@ async function main(
 const program = new Command();
 program
   .name("download-snapshot")
-  .requiredOption("-u, --username <username>", "Nationbuilder Username")
+  .requiredOption("-u, --username <username>", "Nationbuilder username")
   .requiredOption(
     "-p, --password_environment_var <password_environment_var>",
     "Name of environment variable to read password from"
   )
+  .option("-t, --otp <otp>", "TOTP one-time password")
   .option(
-    "-t, --otp <otp>",
-    "TOTP one-time password"
+    "--otpauth_environment_var <otpauth_environment_var>",
+    "Name of environment variable containing otpauth:// URL for TOTP generation"
   )
   .option("--proxy <server>", "Proxy server URL for Playwright")
   .requiredOption(
     "-n, --nationbuilder_url <nationbuilder_url>",
     "URL of your nationbuilder admin login page"
   )
-  .requiredOption("-o, --output_dir <output_dir>", "output_dir")
+  .requiredOption("-o, --output_dir <output_dir>", "Output directory")
   .action((options) => {
     const password = process.env[options.password_environment_var];
-    // ensure password is not undefined
     if (password === undefined) {
       throw new Error(
         `Environment variable ${options.password_environment_var} is not set`
       );
     }
-
+    const otpauthUrl = options.otpauth_environment_var
+      ? process.env[options.otpauth_environment_var]
+      : undefined;
+    const otp = options.otp ?? (otpauthUrl ? totpFromOtpauth(otpauthUrl) : "");
     main(
       options.username,
       password,
-      options.otp,
+      otp,
       options.nationbuilder_url,
       options.output_dir,
       options.proxy
