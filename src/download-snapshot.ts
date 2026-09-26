@@ -1,6 +1,5 @@
 #! /usr/bin/env node
-import { chromium, devices } from "playwright-core";
-import { expect, Locator } from "@playwright/test";
+import { chromium, devices, Page } from "playwright-core";
 import * as logger from "winston";
 import { Command } from "commander";
 import { createHmac } from "crypto";
@@ -26,11 +25,32 @@ function totpFromOtpauth(otpauthUrl: string): string {
   return String(code).padStart(6, "0");
 }
 
+// How long to wait for today's snapshot to become downloadable. NationBuilder
+// has never taken more than a couple of minutes; past this, fail and let the
+// Cloud Run job's retries start over rather than wait on a stuck snapshot.
+const SNAPSHOT_DEADLINE_MS = 5 * 60_000;
+const POLL_INTERVAL_MS = 10_000;
+// If today's row hasn't appeared this many polls after clicking Start, assume
+// the click didn't register and click again, up to MAX_START_ATTEMPTS times.
+const POLLS_BEFORE_RESTART = 3;
+const MAX_START_ATTEMPTS = 3;
+
+/* Log where the browser ended up, so a failure in Cloud Run is diagnosable. */
+async function logPageState(page: Page) {
+  try {
+    logger.error(`Failed on ${page.url()} (title: ${await page.title()})`);
+    const text = await page.locator("body").innerText({ timeout: 5000 });
+    logger.error(`Visible page text: ${text.substring(0, 2000)}`);
+  } catch (error) {
+    logger.error(`Could not capture page state: ${error}`);
+  }
+}
+
 /* accept a usernmae, password, and nationbuilder url */
 async function download_snapshot(
   username: string,
   password: string,
-  otp: string,
+  getOtp: (() => string) | undefined,
   nationbuilder_url: string,
   outputDir: string,
   proxy?: string
@@ -38,14 +58,38 @@ async function download_snapshot(
   const browser = await chromium.launch(
     proxy ? { proxy: { server: proxy } } : {}
   );
-  const desktop = devices["Desktop Chrome HiDPI"];
-  const context = await browser.newContext({
-    ...desktop,
-    locale: 'en-US',
-    timezoneId: 'America/Los_Angeles',
-  });
-  const page = await context.newPage();
+  try {
+    const desktop = devices["Desktop Chrome HiDPI"];
+    const context = await browser.newContext({
+      ...desktop,
+      locale: 'en-US',
+      timezoneId: 'America/Los_Angeles',
+    });
+    // In Cloud Run, traffic goes over a Tailscale DERP relay to a residential
+    // exit node, which is too slow for Playwright's 30s default.
+    context.setDefaultTimeout(90_000);
+    context.setDefaultNavigationTimeout(120_000);
+    const page = await context.newPage();
+    try {
+      await take_snapshot(page, username, password, getOtp, nationbuilder_url, outputDir);
+    } catch (error) {
+      await logPageState(page);
+      throw error;
+    }
+  } finally {
+    // close the browser to terminate the session
+    await browser.close();
+  }
+}
 
+async function take_snapshot(
+  page: Page,
+  username: string,
+  password: string,
+  getOtp: (() => string) | undefined,
+  nationbuilder_url: string,
+  outputDir: string
+) {
   logger.info(`Navigating to ${nationbuilder_url}`);
 
   await page.goto(nationbuilder_url);
@@ -57,58 +101,74 @@ async function download_snapshot(
   await page.getByRole('textbox', { name: "Password" }).fill(password);
   logger.info("Logging in.");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
-  if (otp) {
+  if (getOtp) {
     logger.info("Sending OTP code.");
     await page.getByRole("button", { name: "Google Authenticator or similar" }).click();
-    await page.getByLabel("one-time code").fill(otp);
+    // Generate the code only now, so a slow login can't carry it into the
+    // next 30-second TOTP window.
+    await page.getByLabel("one-time code").fill(getOtp());
     await page.getByRole("button", { name: "Continue", exact: true }).click();
   }
+
+  // Wait for the login flow to hand back to NationBuilder before navigating
+  // away, so we don't interrupt it before the session cookie is set.
+  const adminHost = new URL(nationbuilder_url).hostname;
+  await page.waitForURL(
+    (url) => url.hostname === adminHost && url.pathname.startsWith("/admin")
+  );
   logger.info("Logged in, navigating to database snapshot page.");
-  await page.getByRole("link", { name: "Settings" }).click();
-  await page.getByRole("link", { name: "Database" }).click();
+  await page.goto(new URL("/admin/backups", nationbuilder_url).toString());
 
   // compute string that includes today's date only - excluding time
   const snapshotSignature = `Data Committee Snapshot ${new Date().toISOString().split("T")[0]
     }`;
-  const snapshotTrLocator = `table > tbody > tr:has-text("${snapshotSignature}")`;
+  const snapshotRows = page.locator(
+    `table > tbody > tr:has-text("${snapshotSignature}")`
+  );
+  // .first() in case a repeated Start click produced two rows for today.
+  const downloadButton = snapshotRows
+    .getByRole("link", { name: "download" })
+    .first();
 
-  // if tr with row containing snapshotSignature does not exist in 5 seconds, create a new snapshot
-  const test = await page.locator(snapshotTrLocator).isVisible();
-  try {
-    await expect(page.locator(snapshotTrLocator)).toBeVisible({
-      timeout: 5000,
-    });
+  // Give an existing row for today a moment to render.
+  await snapshotRows.first().waitFor({ timeout: 5000 }).catch(() => { });
+  if ((await snapshotRows.count()) > 0) {
     logger.info(`Snapshot "${snapshotSignature}" found.`);
-  } catch (error) {
-    logger.info(
-      `Expected snapshot "${snapshotSignature}" not found, creating new snapshot.`
-    );
-    await page.getByLabel("Comment").click();
-    await page.getByLabel("Comment").fill(snapshotSignature);
-    await page.getByRole("button", { name: "Start database snapshot" }).click();
-    await page.waitForTimeout(10000); // Wait for 10 seconds to allow page to refresh (flakey)
   }
 
-  // refresh page until download button appears on the snapshot row
-  let timeout = 0;
-  let timeStep = 10000;
-  var downloadButton: Locator | undefined;
-  while (true) {
-    downloadButton = await page
-      .locator(snapshotTrLocator)
-      .getByRole("link", { name: "download" });
-    const isVisible = await downloadButton.isVisible();
-    if (isVisible) {
-      break; // Exit the loop if download button is found
+  // refresh page until download button appears on the snapshot row,
+  // (re)starting the snapshot if its row is missing
+  const deadline = Date.now() + SNAPSHOT_DEADLINE_MS;
+  let startAttempts = 0;
+  let pollsSinceStart = POLLS_BEFORE_RESTART; // start at once if the row is missing
+  while (!(await downloadButton.isVisible())) {
+    if ((await snapshotRows.count()) > 0) {
+      logger.info(`Waiting for '${snapshotSignature}' to complete.`);
+    } else if (pollsSinceStart >= POLLS_BEFORE_RESTART) {
+      if (startAttempts >= MAX_START_ATTEMPTS) {
+        throw new Error(
+          `Snapshot row did not appear after ${startAttempts} attempts to start it`
+        );
+      }
+      logger.info(
+        startAttempts === 0
+          ? `Expected snapshot "${snapshotSignature}" not found, creating new snapshot.`
+          : `Snapshot "${snapshotSignature}" still not listed; starting it again.`
+      );
+      await page.getByLabel("Comment").fill(snapshotSignature);
+      await page.getByRole("button", { name: "Start database snapshot" }).click();
+      startAttempts++;
+      pollsSinceStart = 0;
+    } else {
+      logger.info(`Waiting for '${snapshotSignature}' to be listed.`);
     }
-    logger.info(`Waiting for '${snapshotSignature}' to complete.`);
-    timeout += timeStep;
-    if (timeout >= 600000) {
+    pollsSinceStart++;
+    if (Date.now() >= deadline) {
       throw new Error(
-        "Timeout: Download button did not appear within 10 minutes"
+        `Timeout: Download button did not appear within ${SNAPSHOT_DEADLINE_MS / 60_000} minutes`
       );
     }
-    await page.waitForTimeout(timeStep); // Wait for 10 seconds
+    await page.waitForTimeout(POLL_INTERVAL_MS);
     await page.reload(); // Refresh the page
   }
 
@@ -122,15 +182,12 @@ async function download_snapshot(
 
   await download.saveAs(outputDir + "/" + download.suggestedFilename());
   logger.info(`Download finshed.`);
-
-  // close the browser to terminate the session
-  await browser.close();
 }
 
 async function main(
   username: string,
   password: string,
-  otp: string,
+  getOtp: (() => string) | undefined,
   nationbuilder_url: string,
   outputDir: string,
   proxy?: string
@@ -140,7 +197,7 @@ async function main(
     transports: [new logger.transports.Console()],
   });
 
-  await download_snapshot(username, password, otp, nationbuilder_url, outputDir, proxy);
+  await download_snapshot(username, password, getOtp, nationbuilder_url, outputDir, proxy);
 }
 
 const program = new Command();
@@ -172,11 +229,15 @@ program
     const otpauthUrl = options.otpauth_environment_var
       ? process.env[options.otpauth_environment_var]
       : undefined;
-    const otp = options.otp ?? (otpauthUrl ? totpFromOtpauth(otpauthUrl) : "");
+    const getOtp = options.otp
+      ? () => options.otp as string
+      : otpauthUrl
+        ? () => totpFromOtpauth(otpauthUrl)
+        : undefined;
     main(
       options.username,
       password,
-      otp,
+      getOtp,
       options.nationbuilder_url,
       options.output_dir,
       options.proxy
